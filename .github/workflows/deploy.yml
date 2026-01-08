@@ -15,7 +15,7 @@ env:
   NODE_VERSION: 18
 
 jobs:
-  # Job 1 : Node.js Testing
+  # Job 1: Node.js Testing
   test:
     name: Test Node.js Application
     runs-on: ubuntu-latest
