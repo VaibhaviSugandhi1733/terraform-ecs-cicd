@@ -1,0 +1,281 @@
+name: Build and Deploy to AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: nodejs-ecs-app
+  ECS_CLUSTER: nodejs-ecs-app-cluster
+  ECS_SERVICE: nodejs-ecs-app-service
+  CONTAINER_NAME: nodejs-ecs-app
+  TF_VERSION: 1.6.0
+  NODE_VERSION: 18
+
+jobs:
+  # Job 1: Node.js Testing
+  test:
+    name: Test Node.js Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        working-directory: src
+        run: npm install
+
+      - name: Run linting
+        working-directory: src
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Run tests with coverage
+        working-directory: src
+        run: npm run test:ci
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: src/junit.xml
+          retention-days: 30
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: src/coverage/
+          retention-days: 30
+
+  # Job 2: Terraform Infrastructure (runs in parallel with test)
+  terraform:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+
+    outputs:
+      ecr_repository_url: ${{ steps.tf-outputs.outputs.ecr_repository_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: tf-outputs
+        working-directory: terraform
+        run: |
+          echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+
+  # Job 3: Build, Scan, and Push Docker Image
+  build-scan-push:
+    name: Build, Scan, and Push
+    needs: [test, terraform]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    outputs:
+      image_tag: ${{ steps.generate-tag.outputs.image_tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image tag
+        id: generate-tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${TIMESTAMP}-${SHORT_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.generate-tag.outputs.image_tag }}
+        run: |
+          docker build \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --file Dockerfile \
+            .
+
+      # Trivy vulnerability scan - filesystem scan
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'src'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      # Trivy vulnerability scan - Docker image
+      - name: Run Trivy vulnerability scanner (Docker image)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.generate-tag.outputs.image_tag }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      # Trivy scan with SARIF output for GitHub Security tab
+      - name: Run Trivy scanner (SARIF output)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.generate-tag.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+      # Trivy scan summary in job output
+      - name: Generate Trivy scan summary
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.generate-tag.outputs.image_tag }}
+          format: 'json'
+          output: 'trivy-results.json'
+        continue-on-error: true
+
+      - name: Display scan summary
+        run: |
+          echo "## Docker Image Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f trivy-results.json ]; then
+            CRITICAL=$(cat trivy-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+            HIGH=$(cat trivy-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length')
+            MEDIUM=$(cat trivy-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length')
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+            echo "| High | $HIGH |" >> $GITHUB_STEP_SUMMARY
+            echo "| Medium | $MEDIUM |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No scan results available" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.generate-tag.outputs.image_tag }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "Pushed image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # Job 4: Deploy to ECS
+  deploy:
+    name: Deploy to ECS
+    needs: [terraform, build-scan-push]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.CONTAINER_NAME }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-scan-push.outputs.image_tag }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ needs.build-scan-push.outputs.image_tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | ${{ env.ECS_CLUSTER }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.ECS_SERVICE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
