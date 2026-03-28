@@ -7,7 +7,7 @@ app.use(express.json());
 
 app.get('/', (req, res) => {
   res.json({
-    message: 'Hello  from AWS ECS!',
+    message: 'Hello from AWS ECS!',
     timestamp: new Date().toISOString(),
     version: 'v1.0.4'
   });
