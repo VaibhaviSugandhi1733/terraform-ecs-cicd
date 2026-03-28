@@ -8,7 +8,6 @@ terraform {
     }
   }
 
-
   backend "s3" {
     bucket         = "vaibhavi-terraform-ecs-pipeline1"
     key            = "ecs-app/terraform.tfstate"
