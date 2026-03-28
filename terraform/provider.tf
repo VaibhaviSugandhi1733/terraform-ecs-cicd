@@ -9,7 +9,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "vaibhavi-terraform-ecs-pipeline"
+    bucket         = "vaibhavi-terraform-ecs-pipeline1"
     key            = "ecs-app/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
